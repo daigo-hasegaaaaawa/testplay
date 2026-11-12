@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>YouTube Rhythm Prototype</title>
+<style>
+  body { margin: 0; background: #111; color: #fff; font-family: sans-serif; display: flex; height: 100vh; overflow: hidden; }
+  #left-panel { width: 360px; padding: 15px; background: #1a1a1a; display: flex; flex-direction: column; gap: 10px; box-sizing: border-box; z-index: 2; }
+  #game-container { flex: 1; position: relative; display: flex; justify-content: center; align-items: center; background: #000; }
+  canvas { background: rgba(15, 15, 25, 0.85); border-left: 2px solid #444; border-right: 2px solid #444; z-index: 1; }
+  #yt-bg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0.35; }
+  input, button, textarea { width: 100%; padding: 8px; box-sizing: border-box; background: #2a2a2a; color: #fff; border: 1px solid #555; border-radius: 4px; }
+  button { cursor: pointer; background: #0066cc; border: none; font-weight: bold; }
+  button:hover { background: #0077ee; }
+  button.record { background: #cc3300; }
+  .keys-hint { display: flex; justify-content: space-around; font-size: 14px; color: #aaa; }
+  #status-msg { font-size: 12px; color: #ffcc00; min-height: 18px; }
+</style>
+</head>
+<body>
+
+<div id="left-panel">
+  <h3>YouTube 音ゲー Proto</h3>
+  <div id="status-msg">プレイヤー準備中...</div>
+
+  <label>YouTube Video ID / URL:</label>
+  <input type="text" id="video-input" value="K4DyBUG242c" placeholder="動画ID または URL">
+  <button id="load-btn">動画を読み込む</button>
+
+  <hr style="width:100%; border-color:#333;">
+
+  <button id="play-btn">▶ ゲーム開始 (Play)</button>
+  <button id="rec-btn" class="record">● 譜面記録モード (Record)</button>
+  <div class="keys-hint">操作キー: [ D ] [ F ] [ J ] [ K ]</div>
+
+  <label>譜面データ (JSON):</label>
+  <textarea id="chart-data" rows="7"></textarea>
+  <button id="apply-chart-btn">譜面を反映</button>
+  <div id="score-display" style="font-size: 20px; font-weight: bold; margin-top: auto;">SCORE: 0 / COMBO: 0</div>
+</div>
+
+<div id="game-container">
+  <div id="yt-bg"><div id="player"></div></div>
+  <canvas id="gameCanvas" width="400" height="600"></canvas>
+</div>
+
+<script>
+// file:// で開かれている場合の警告チェック
+const statusEl = document.getElementById('status-msg');
+if (location.protocol === 'file:') {
+  statusEl.style.color = '#ff4444';
+  statusEl.textContent = '⚠ file:// で開かれています。localhost経由で開いてください。';
+}
+
+let chart = [
+  { time: 1.0, lane: 0 }, { time: 1.5, lane: 1 }, { time: 2.0, lane: 2 }, { time: 2.5, lane: 3 },
+  { time: 3.0, lane: 1 }, { time: 3.0, lane: 2 }, { time: 3.5, lane: 0 }, { time: 3.5, lane: 3 }
+];
+document.getElementById('chart-data').value = JSON.stringify(chart);
+
+const tag = document.createElement('script');
+tag.src = "https://www.youtube.com/iframe_api";
+document.head.appendChild(tag);
+
+let player;
+let isReady = false;
+
+function onYouTubeIframeAPIReady() {
+  const playerVars = {
+    'playsinline': 1,
+    'controls': 0,
+    'disablekb': 1,
+    'rel': 0
+  };
+  // http / https 環境の場合は origin を明示して設定エラーを防ぐ
+  if (location.protocol.startsWith('http')) {
+    playerVars.origin = window.location.origin;
+  }
+
+  player = new YT.Player('player', {
+    width: '100%', height: '100%',
+    videoId: 'K4DyBUG242c', // NCS (Cartoon - On & On) 埋め込み許可済み音源
+    playerVars: playerVars,
+    events: {
+      'onReady': () => {
+        isReady = true;
+        if (location.protocol !== 'file:') {
+          statusEl.style.color = '#00ff88';
+          statusEl.textContent = '✓ プレイヤー準備完了';
+        }
+      },
+      'onError': (e) => {
+        const errMap = {
+          2: '動画IDが無効です (Error 2)',
+          5: 'HTML5プレイヤーエラー (Error 5)',
+          100: '動画が見つかりません (Error 100)',
+          101: '埋め込み再生が許可されていない動画です (Error 101)',
+          150: '埋め込み再生が制限されている音楽動画です (Error 150)',
+          153: 'ローカル(file://)からの再生ブロック (Error 153: localhostで開いてください)'
+        };
+        statusEl.style.color = '#ff4444';
+        statusEl.textContent = errMap[e.data] || `再生エラーが発生しました (Code: ${e.data})`;
+      }
+    }
+  });
+}
+
+// --- ゲーム状態管理 ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const LANES = 4;
+const LANE_WIDTH = canvas.width / LANES;
+const JUDGE_Y = 520;
+const NOTE_SPEED = 400;
+const KEYS = ['KeyD', 'KeyF', 'KeyJ', 'KeyK'];
+const KEY_LABELS = ['D', 'F', 'J', 'K'];
+let keyPressed = [false, false, false, false];
+
+let mode = 'idle';
+let score = 0, combo = 0;
+let activeNotes = [];
+let recordedNotes = [];
+let judgeText = '', judgeTimer = 0;
+
+let lastSyncYtTime = 0;
+let lastSyncPerfTime = 0;
+
+function getSmoothTime() {
+  if (!isReady || !player || typeof player.getPlayerState !== 'function') return 0;
+  if (player.getPlayerState() !== YT.PlayerState.PLAYING) return 0;
+  const ytTime = player.getCurrentTime();
+  const now = performance.now();
+  if (Math.abs(ytTime - lastSyncYtTime) > 0.01) {
+    lastSyncYtTime = ytTime;
+    lastSyncPerfTime = now;
+  }
+  return lastSyncYtTime + (now - lastSyncPerfTime) / 1000;
+}
+
+document.getElementById('load-btn').onclick = () => {
+  if (!isReady) return;
+  let val = document.getElementById('video-input').value.trim();
+  const match = val.match(/(?:v=|youtu\.be\/|embed\/)([a-zA-Z0-9_-]{11})/);
+  const vid = match ? match[1] : val;
+  player.loadVideoById(vid);
+  player.pauseVideo();
+  mode = 'idle';
+  statusEl.textContent = `動画ID [${vid}] を読み込みました`;
+};
+
+document.getElementById('apply-chart-btn').onclick = () => {
+  try {
+    chart = JSON.parse(document.getElementById('chart-data').value);
+    statusEl.textContent = '✓ 譜面データを反映しました';
+  } catch (e) { alert('JSONの形式が正しくありません'); }
+};
+
+document.getElementById('play-btn').onclick = () => {
+  if (!isReady) return;
+  chart = JSON.parse(document.getElementById('chart-data').value);
+  activeNotes = chart.map(n => ({ ...n, hit: false }));
+  score = 0; combo = 0;
+  updateScoreUI();
+  mode = 'play';
+  player.seekTo(0);
+  player.playVideo();
+};
+
+document.getElementById('rec-btn').onclick = () => {
+  if (!isReady) return;
+  if (mode === 'record') {
+    mode = 'idle';
+    player.pauseVideo();
+    document.getElementById('rec-btn').textContent = '● 譜面記録モード (Record)';
+    document.getElementById('chart-data').value = JSON.stringify(recordedNotes);
+  } else {
+    recordedNotes = [];
+    mode = 'record';
+    document.getElementById('rec-btn').textContent = '■ 記録停止してJSON出力';
+    player.seekTo(0);
+    player.playVideo();
+  }
+};
+
+window.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  const lane = KEYS.indexOf(e.code);
+  if (lane === -1) return;
+  keyPressed[lane] = true;
+
+  const currentTime = getSmoothTime();
+  if (mode === 'record' && currentTime > 0) {
+    recordedNotes.push({ time: Number(currentTime.toFixed(3)), lane });
+    showJudge('REC', '#ff6600');
+  } else if (mode === 'play') {
+    let target = null;
+    let minDiff = Infinity;
+    for (const note of activeNotes) {
+      if (!note.hit && note.lane === lane) {
+        const diff = Math.abs(note.time - currentTime);
+        if (diff < minDiff) { minDiff = diff; target = note; }
+      }
+    }
+    if (target && minDiff <= 0.15) {
+      target.hit = true;
+      if (minDiff <= 0.05) {
+        score += 1000; combo++; showJudge('PERFECT!', '#00ffff');
+      } else if (minDiff <= 0.10) {
+        score += 500; combo++; showJudge('GREAT', '#00ff66');
+      } else {
+        score += 100; combo = 0; showJudge('GOOD', '#ffff00');
+      }
+      updateScoreUI();
+    }
+  }
+});
+
+window.addEventListener('keyup', e => {
+  const lane = KEYS.indexOf(e.code);
+  if (lane !== -1) keyPressed[lane] = false;
+});
+
+let judgeColor = '#fff';
+function showJudge(text, color) {
+  judgeText = text;
+  judgeColor = color;
+  judgeTimer = 15;
+}
+
+function updateScoreUI() {
+  document.getElementById('score-display').textContent = `SCORE: ${score} / COMBO: ${combo}`;
+}
+
+function loop() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const currentTime = getSmoothTime();
+
+  for (let i = 0; i < LANES; i++) {
+    const x = i * LANE_WIDTH;
+    if (keyPressed[i]) {
+      ctx.fillStyle = 'rgba(0, 180, 255, 0.2)';
+      ctx.fillRect(x, 0, LANE_WIDTH, JUDGE_Y);
+    }
+    ctx.strokeStyle = '#333';
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+
+    ctx.fillStyle = '#666';
+    ctx.font = '16px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(KEY_LABELS[i], x + LANE_WIDTH / 2, JUDGE_Y + 40);
+  }
+
+  ctx.strokeStyle = '#00ffff';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, JUDGE_Y); ctx.lineTo(canvas.width, JUDGE_Y); ctx.stroke();
+  ctx.lineWidth = 1;
+
+  if (mode === 'play' && currentTime > 0) {
+    for (const note of activeNotes) {
+      if (note.hit) continue;
+      const timeDiff = note.time - currentTime;
+      if (timeDiff < -0.15) {
+        note.hit = true;
+        combo = 0;
+        showJudge('MISS', '#ff0044');
+        updateScoreUI();
+        continue;
+      }
+      const y = JUDGE_Y - timeDiff * NOTE_SPEED;
+      if (y > -20 && y < canvas.height) {
+        ctx.fillStyle = (note.lane === 1 || note.lane === 2) ? '#00d2ff' : '#ff4b72';
+        ctx.fillRect(note.lane * LANE_WIDTH + 6, y - 8, LANE_WIDTH - 12, 16);
+      }
+    }
+  }
+
+  if (judgeTimer > 0) {
+    ctx.fillStyle = judgeColor;
+    ctx.font = 'bold 28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(judgeText, canvas.width / 2, JUDGE_Y - 80);
+    judgeTimer--;
+  }
+
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
